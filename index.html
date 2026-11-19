@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Repulsor – WebXR-Prototyp</title>
+<style>
+  body { margin: 0; background: #111; color: #eee; font-family: system-ui, sans-serif; overflow: hidden; }
+  #info { position: absolute; top: 0; left: 0; right: 0; padding: 16px; text-align: center; line-height: 1.5; z-index: 1; }
+  #info h1 { font-size: 20px; margin: 0 0 6px; }
+  #info p { margin: 2px 0; font-size: 14px; opacity: .85; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/",
+    "cannon-es": "https://cdn.jsdelivr.net/npm/cannon-es@0.20.0/dist/cannon-es.js"
+  }
+}
+</script>
+</head>
+<body>
+<div id="info">
+  <h1>Repulsor</h1>
+  <p>Auf der Quest 3 unten auf „START AR“ tippen.</p>
+  <p>Trigger halten: Druckwelle · Grip-Taste: neue Mauer vor dir</p>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { ARButton } from 'three/addons/webxr/ARButton.js';
+import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
+import * as CANNON from 'cannon-es';
+
+// ================= Einstellungen (zum Herumspielen) =================
+const CFG = {
+  wallDistance: 1.8,  // Abstand der Mauer vor dir (Meter)
+  blockSize: 0.22,    // Kantenlänge der Würfel (Meter)
+  cols: 6,
+  rows: 5,
+  blastRange: 4.0,    // Reichweite der Druckwelle (Meter)
+  blastAngle: 0.45,   // halber Öffnungswinkel des Kegels (Radiant, ca. 26°)
+  blastForce: 25,     // Stärke der Druckwelle
+};
+const COLORS = [0x4f8cff, 0xff6b6b, 0xffc145, 0x3ddc97, 0xb388ff, 0xff8fd8];
+
+// ================= three.js: Renderer, Szene, Kamera =================
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.xr.enabled = true;                          // WebXR einschalten
+renderer.xr.setReferenceSpaceType('local-floor');    // y = 0 ist der echte Boden
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 50);
+camera.position.set(0, 1.6, 0);
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0x444466, 1.2));
+const sun = new THREE.DirectionalLight(0xffffff, 1.5);
+sun.castShadow = true;
+sun.shadow.mapSize.set(1024, 1024);
+Object.assign(sun.shadow.camera, { left: -3, right: 3, top: 3, bottom: -3, near: 0.1, far: 12 });
+scene.add(sun, sun.target);
+
+// Unsichtbarer Boden, der nur Schatten zeigt – so "stehen" die Blöcke auf deinem echten Boden
+const shadowFloor = new THREE.Mesh(
+  new THREE.PlaneGeometry(30, 30),
+  new THREE.ShadowMaterial({ opacity: 0.3 })
+);
+shadowFloor.rotation.x = -Math.PI / 2;
+shadowFloor.receiveShadow = true;
+scene.add(shadowFloor);
+
+// ================= cannon-es: Physik =================
+const world = new CANNON.World({ gravity: new CANNON.Vec3(0, -9.82, 0) });
+world.allowSleep = true;
+world.broadphase = new CANNON.SAPBroadphase(world);
+world.defaultContactMaterial.friction = 0.4;
+world.defaultContactMaterial.restitution = 0.2;
+
+const floorBody = new CANNON.Body({ mass: 0, shape: new CANNON.Plane() });
+floorBody.quaternion.setFromEuler(-Math.PI / 2, 0, 0);
+world.addBody(floorBody);
+
+const objects = []; // Paare aus { mesh (Grafik), body (Physik) }
+
+function addObject(kind, pos, yaw, color) {
+  const s = CFG.blockSize;
+  let geometry, shape, mass;
+  if (kind === 'sphere') {
+    const r = s * 0.5;
+    geometry = new THREE.SphereGeometry(r, 24, 16);
+    shape = new CANNON.Sphere(r);
+    mass = 0.8;
+  } else if (kind === 'cylinder') {
+    const r = s * 0.45, h = s * 1.2;
+    geometry = new THREE.CylinderGeometry(r, r, h, 16);
+    shape = new CANNON.Cylinder(r, r, h, 16);
+    mass = 1;
+  } else {
+    geometry = new THREE.BoxGeometry(s, s, s);
+    shape = new CANNON.Box(new CANNON.Vec3(s / 2, s / 2, s / 2));
+    mass = 1;
+  }
+
+  const mesh = new THREE.Mesh(
+    geometry,
+    new THREE.MeshStandardMaterial({ color, roughness: 0.5, metalness: 0.1 })
+  );
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
+  scene.add(mesh);
+
+  const body = new CANNON.Body({ mass, shape, linearDamping: 0.05, angularDamping: 0.05 });
+  body.position.set(pos.x, pos.y, pos.z);
+  body.quaternion.setFromAxisAngle(new CANNON.Vec3(0, 1, 0), yaw);
+  body.sleepSpeedLimit = 0.2;
+  world.addBody(body);
+
+  objects.push({ mesh, body });
+}
+
+function clearObjects() {
+  for (const { mesh, body } of objects) {
+    scene.remove(mesh);
+    mesh.geometry.dispose();
+    mesh.material.dispose();
+    world.removeBody(body);
+  }
+  objects.length = 0;
+}
+
+// Baut eine Mauer aus Würfeln vor der angegebenen Position, plus ein paar Kugeln und Zylinder obendrauf
+function spawnWall(headPos, forward) {
+  clearObjects();
+  const f = forward.clone().setY(0);
+  if (f.lengthSq() < 1e-6) f.set(0, 0, -1);
+  f.normalize();
+  const right = new THREE.Vector3().crossVectors(f, new THREE.Vector3(0, 1, 0)).normalize();
+  const origin = headPos.clone().setY(0).addScaledVector(f, CFG.wallDistance);
+  const yaw = Math.atan2(f.x, f.z);
+  const s = CFG.blockSize;
+
+  for (let r = 0; r < CFG.rows; r++) {
+    const offset = (r % 2) ? s / 2 : 0; // versetzt wie bei Ziegeln
+    for (let c = 0; c < CFG.cols; c++) {
+      const x = (c - (CFG.cols - 1) / 2) * s * 1.01 + offset;
+      const p = origin.clone().addScaledVector(right, x);
+      p.y = s / 2 + r * s * 1.001 + 0.001;
+      addObject('box', p, yaw, COLORS[(r + c) % COLORS.length]);
+    }
+  }
+
+  const topY = CFG.rows * s + 0.01;
+  [-1.5, 1.5].forEach((x, i) => {
+    const p = origin.clone().addScaledVector(right, x * s);
+    p.y = topY + s * 0.5;
+    addObject('sphere', p, yaw, COLORS[(i + 2) % COLORS.length]);
+  });
+  [-0.5, 0.5].forEach((x, i) => {
+    const p = origin.clone().addScaledVector(right, x * s);
+    p.y = topY + s * 0.6;
+    addObject('cylinder', p, yaw, COLORS[(i + 4) % COLORS.length]);
+  });
+
+  sun.position.copy(origin).add(new THREE.Vector3(1.5, 4, 1.5));
+  sun.target.position.copy(origin);
+}
+
+function respawnInFront() {
+  const pos = new THREE.Vector3();
+  const dir = new THREE.Vector3();
+  camera.getWorldPosition(pos);
+  camera.getWorldDirection(dir);
+  spawnWall(pos, dir);
+}
+
+// ================= Controller (über WebXR) =================
+function makeRepulsorFx() {
+  const group = new THREE.Group();
+  const core = new THREE.Mesh(
+    new THREE.SphereGeometry(0.015, 16, 12),
+    new THREE.MeshBasicMaterial({ color: 0x9fe8ff })
+  );
+  const length = 1.2;
+  const coneGeo = new THREE.ConeGeometry(Math.tan(CFG.blastAngle) * length, length, 32, 1, true);
+  coneGeo.rotateX(Math.PI / 2);         // Spitze zeigt zur Hand ...
+  coneGeo.translate(0, 0, -length / 2); // ... und der Kegel öffnet sich nach vorne (-Z)
+  const cone = new THREE.Mesh(coneGeo, new THREE.MeshBasicMaterial({
+    color: 0x66ccff, transparent: true, opacity: 0.25,
+    blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide,
+  }));
+  cone.visible = false;
+  group.add(core, cone);
+  return { group, core, cone };
+}
+
+const modelFactory = new XRControllerModelFactory();
+const controllers = [];
+for (let i = 0; i < 2; i++) {
+  const controller = renderer.xr.getController(i); // Zielstrahl-Position/Richtung aus WebXR
+  const fx = makeRepulsorFx();
+  controller.add(fx.group);
+  controller.userData = { firing: false, inputSource: null, lastPulse: 0, fx };
+
+  controller.addEventListener('connected', (e) => { controller.userData.inputSource = e.data; });
+  controller.addEventListener('disconnected', () => {
+    controller.userData.inputSource = null;
+    controller.userData.firing = false;
+  });
+  controller.addEventListener('selectstart', () => { controller.userData.firing = true; });  // Trigger
+  controller.addEventListener('selectend', () => { controller.userData.firing = false; });
+  controller.addEventListener('squeezestart', () => respawnInFront());                        // Grip
+  scene.add(controller);
+
+  const grip = renderer.xr.getControllerGrip(i); // für das 3D-Modell des Controllers
+  grip.add(modelFactory.createControllerModel(grip));
+  scene.add(grip);
+
+  controllers.push(controller);
+}
+
+// ================= Die Druckwelle =================
+const handPos = new THREE.Vector3();
+const handDir = new THREE.Vector3();
+const handQuat = new THREE.Quaternion();
+const toObj = new THREE.Vector3();
+
+function updateBlast(controller, dt, time) {
+  const ud = controller.userData;
+  ud.fx.cone.visible = ud.firing;
+  if (!ud.firing) {
+    ud.fx.core.scale.setScalar(1);
+    return;
+  }
+
+  // Flackern für den Effekt
+  ud.fx.cone.material.opacity = 0.15 + Math.random() * 0.15;
+  ud.fx.core.scale.setScalar(1.5 + Math.random() * 0.5);
+
+  controller.getWorldPosition(handPos);
+  controller.getWorldQuaternion(handQuat);
+  handDir.set(0, 0, -1).applyQuaternion(handQuat);
+
+  let hits = 0;
+  for (const { body } of objects) {
+    toObj.set(body.position.x - handPos.x, body.position.y - handPos.y, body.position.z - handPos.z);
+    const dist = toObj.length();
+    if (dist > CFG.blastRange || dist < 1e-3) continue;
+    const angle = handDir.angleTo(toObj);
+    if (angle > CFG.blastAngle) continue;
+
+    // je näher und je zentraler, desto stärker
+    const strength = CFG.blastForce * (1 - dist / CFG.blastRange) * (1 - angle / CFG.blastAngle);
+    toObj.normalize().add(handDir).normalize(); // Mischung aus Handrichtung und Richtung zum Objekt
+    const k = strength * body.mass * dt;
+    body.wakeUp();
+    body.applyImpulse(new CANNON.Vec3(toObj.x * k, toObj.y * k + k * 0.15, toObj.z * k));
+    hits++;
+  }
+
+  // Vibration im Controller (gedrosselt)
+  if (time - ud.lastPulse > 60) {
+    ud.lastPulse = time;
+    const actuator = ud.inputSource?.gamepad?.hapticActuators?.[0];
+    try { actuator?.pulse(hits ? 0.8 : 0.25, 60); } catch (e) { /* nicht unterstützt */ }
+  }
+}
+
+// ================= Start & Spielschleife =================
+document.body.appendChild(ARButton.createButton(renderer, { optionalFeatures: ['local-floor'] }));
+
+spawnWall(camera.position, new THREE.Vector3(0, 0, -1)); // Vorschau am Desktop
+
+let spawnPending = 0;
+renderer.xr.addEventListener('sessionstart', () => { spawnPending = 5; }); // nach ein paar Frames vor dir aufbauen
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+const clock = new THREE.Clock();
+renderer.setAnimationLoop((time) => {
+  const dt = Math.min(clock.getDelta(), 1 / 30);
+
+  if (spawnPending > 0 && --spawnPending === 0) respawnInFront();
+
+  for (const c of controllers) updateBlast(c, dt, time);
+
+  world.step(1 / 72, dt, 3);
+
+  for (const { mesh, body } of objects) {
+    mesh.position.copy(body.position);
+    mesh.quaternion.copy(body.quaternion);
+  }
+
+  renderer.render(scene, camera);
+});
+</script>
+</body>
+</html>
