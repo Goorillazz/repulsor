@@ -27,6 +27,7 @@
   <p>Linker Trigger halten: ansaugen · Rechter Trigger drücken: Druckwelle · Grip: neue Mauer</p>
   <p>Sticks: links/rechts = Öffnungswinkel, oben/unten = Stärke</p>
   <p>Blöcke schweben? Controller auf den Boden halten und A oder X drücken.</p>
+  <p>B oder Y: Diagnose-Anzeige ein/aus</p>
 </div>
 
 <script type="module">
@@ -118,6 +119,77 @@ const floorBody = new CANNON.Body({ mass: 0, shape: new CANNON.Plane() });
 floorBody.quaternion.setFromEuler(-Math.PI / 2, 0, 0);
 world.addBody(floorBody);
 
+// ================= Diagnose =================
+// Markierung: weißer Ring mit Stab am Startpunkt der Mauer, ohne Physik.
+// Bleibt sie sichtbar, wenn die Blöcke verschwinden, liegt es an der Physik – verschwindet sie mit, an Darstellung/Tracking.
+const marker = new THREE.Group();
+{
+  const ringGeo = new THREE.RingGeometry(0.25, 0.28, 48);
+  ringGeo.rotateX(-Math.PI / 2);
+  const poleGeo = new THREE.CylinderGeometry(0.006, 0.006, 1.6, 8);
+  poleGeo.translate(0, 0.8, 0);
+  const mat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.7, side: THREE.DoubleSide });
+  const ring = new THREE.Mesh(ringGeo, mat);
+  ring.position.y = 0.003;
+  const pole = new THREE.Mesh(poleGeo, mat);
+  ring.frustumCulled = pole.frustumCulled = false;
+  marker.add(ring, pole);
+}
+scene.add(marker);
+
+// Anzeige vor den Augen (B- oder Y-Taste blendet sie ein und aus)
+const hud = (() => {
+  const canvas = document.createElement('canvas');
+  canvas.width = 640;
+  canvas.height = 200;
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  const mesh = new THREE.Mesh(
+    new THREE.PlaneGeometry(0.32, 0.1),
+    new THREE.MeshBasicMaterial({ map: texture, transparent: true, depthTest: false, depthWrite: false })
+  );
+  mesh.position.set(0, -0.14, -0.5);
+  mesh.renderOrder = 999;
+  mesh.frustumCulled = false;
+  camera.add(mesh);
+  return { canvas, texture, mesh, lastUpdate: 0 };
+})();
+scene.add(camera); // nötig, damit die Anzeige an der Kamera mitgezeichnet wird
+
+let referenceResets = 0;
+
+function updateHud(now) {
+  if (!hud.mesh.visible || now - hud.lastUpdate < 0.25) return;
+  hud.lastUpdate = now;
+  camera.getWorldPosition(headPos);
+
+  let maxMoved = 0;
+  let belowFloor = 0;
+  for (const o of objects) {
+    const moved = Math.hypot(o.body.position.x - o.start.x, o.body.position.y - o.start.y, o.body.position.z - o.start.z);
+    maxMoved = Math.max(maxMoved, moved);
+    if (o.body.position.y < floorY - 0.05) belowFloor++;
+  }
+  const toMarker = Math.hypot(headPos.x - marker.position.x, headPos.z - marker.position.z);
+
+  const lines = [
+    `Boden: ${floorSource}  y = ${floorY.toFixed(2)} m   Resets: ${referenceResets}`,
+    `Kopf: x ${headPos.x.toFixed(2)}  y ${headPos.y.toFixed(2)}  z ${headPos.z.toFixed(2)}   Abstand Ring: ${toMarker.toFixed(2)} m`,
+    `Blöcke: ${objects.length}   max. bewegt: ${maxMoved.toFixed(2)} m   unter Boden: ${belowFloor}`,
+  ];
+  const ctx = hud.canvas.getContext('2d');
+  ctx.clearRect(0, 0, 640, 200);
+  ctx.fillStyle = 'rgba(10, 14, 24, 0.75)';
+  ctx.beginPath();
+  ctx.roundRect(2, 2, 636, 196, 16);
+  ctx.fill();
+  ctx.fillStyle = '#e8f0ff';
+  ctx.font = '26px ui-monospace, monospace';
+  ctx.textBaseline = 'middle';
+  lines.forEach((line, i) => ctx.fillText(line, 20, 40 + i * 60));
+  hud.texture.needsUpdate = true;
+}
+
 // ================= Boden: Höhe des echten Bodens =================
 let floorY = 0;            // aktuelle Bodenhöhe in Metern
 let floorSource = 'none';  // 'none' = noch unbekannt, 'planes' = aus dem Raumscan, 'manual' = per Controller gesetzt
@@ -131,7 +203,8 @@ function setFloor(y) {
 // Sucht im Raumscan (WebXR plane-detection) nach dem Boden
 const headPos = new THREE.Vector3();
 function detectFloor(frame) {
-  if (!frame || floorSource === 'manual') return;
+  // Einmal gefundener Boden bleibt fest – sonst könnte er beim Herumlaufen springen
+  if (!frame || floorSource !== 'none') return;
   const planes = frame.detectedPlanes;
   if (!planes || planes.size === 0) return;
   const ref = renderer.xr.getReferenceSpace();
@@ -148,7 +221,7 @@ function detectFloor(frame) {
     else if (y < headPos.y - 0.8 && (lowest === null || y < lowest)) lowest = y;
   }
   const best = floor ?? lowest;
-  if (best !== null && (floorSource === 'none' || Math.abs(best - floorY) > 0.02)) {
+  if (best !== null) {
     setFloor(best);
     floorSource = 'planes';
   }
@@ -181,6 +254,7 @@ function addObject(kind, pos, yaw, color) {
   );
   mesh.castShadow = true;
   mesh.receiveShadow = true;
+  mesh.frustumCulled = false; // nie wegoptimieren, auch nicht am Rand des Sichtfelds oder ganz nah
   scene.add(mesh);
 
   const body = new CANNON.Body({ mass, shape, linearDamping: 0.05, angularDamping: 0.05 });
@@ -189,7 +263,7 @@ function addObject(kind, pos, yaw, color) {
   body.sleepSpeedLimit = 0.2;
   world.addBody(body);
 
-  objects.push({ mesh, body });
+  objects.push({ mesh, body, start: new THREE.Vector3(pos.x, pos.y, pos.z) });
 }
 
 function clearObjects() {
@@ -237,6 +311,8 @@ function spawnWall(headPos, forward) {
 
   sun.position.copy(origin).add(new THREE.Vector3(1.5, 4, 1.5));
   sun.target.position.copy(origin);
+
+  marker.position.set(origin.x, floorY, origin.z); // Diagnose-Markierung an den Startpunkt der Mauer
 }
 
 function respawnInFront() {
@@ -362,6 +438,14 @@ function updateStick(controller, dt, now) {
     ud.labelOverride = 'Boden gesetzt';
   }
   ud.prevA = buttonA;
+
+  // B- bzw. Y-Taste: Diagnose-Anzeige ein/aus
+  const buttonB = ud.inputSource?.gamepad?.buttons?.[5]?.pressed ?? false;
+  if (buttonB && !ud.prevB) {
+    hud.mesh.visible = !hud.mesh.visible;
+    marker.visible = hud.mesh.visible;
+  }
+  ud.prevB = buttonB;
 
   const fx = ud.fx;
   const adjusting = now < ud.showUntil;
@@ -597,6 +681,11 @@ renderer.xr.addEventListener('sessionstart', () => {
   setFloor(0);
   waitingForSpawn = true;
   sessionStart = performance.now() / 1000;
+  referenceResets = 0;
+  // Meldet, wenn die Quest den Koordinatenursprung neu setzt (dann würden die Blöcke "springen")
+  try {
+    renderer.xr.getReferenceSpace()?.addEventListener('reset', () => { referenceResets++; });
+  } catch (e) { /* nicht verfügbar */ }
 });
 
 window.addEventListener('resize', () => {
@@ -631,10 +720,17 @@ renderer.setAnimationLoop((time, frame) => {
   world.step(1 / 72, dt, 3);
 
   for (const { mesh, body } of objects) {
+    // Sicherheitsnetz: was durch den Boden gerutscht ist, wird wieder daraufgesetzt
+    if (body.position.y < floorY - 0.3) {
+      body.position.y = floorY + CFG.blockSize;
+      body.velocity.set(0, 0, 0);
+      body.angularVelocity.set(0, 0, 0);
+    }
     mesh.position.copy(body.position);
     mesh.quaternion.copy(body.quaternion);
   }
 
+  updateHud(now);
   renderer.render(scene, camera);
 });
 </script>
