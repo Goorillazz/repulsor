@@ -26,6 +26,7 @@
   <p>Auf der Quest 3 unten auf „START AR“ tippen.</p>
   <p>Linker Trigger halten: ansaugen · Rechter Trigger drücken: Druckwelle · Grip: neue Mauer</p>
   <p>Sticks: links/rechts = Öffnungswinkel, oben/unten = Stärke</p>
+  <p>Blöcke schweben? Controller auf den Boden halten und A oder X drücken.</p>
 </div>
 
 <script type="module">
@@ -117,6 +118,42 @@ const floorBody = new CANNON.Body({ mass: 0, shape: new CANNON.Plane() });
 floorBody.quaternion.setFromEuler(-Math.PI / 2, 0, 0);
 world.addBody(floorBody);
 
+// ================= Boden: Höhe des echten Bodens =================
+let floorY = 0;            // aktuelle Bodenhöhe in Metern
+let floorSource = 'none';  // 'none' = noch unbekannt, 'planes' = aus dem Raumscan, 'manual' = per Controller gesetzt
+
+function setFloor(y) {
+  floorY = y;
+  floorBody.position.y = y;
+  shadowFloor.position.y = y + 0.001;
+}
+
+// Sucht im Raumscan (WebXR plane-detection) nach dem Boden
+const headPos = new THREE.Vector3();
+function detectFloor(frame) {
+  if (!frame || floorSource === 'manual') return;
+  const planes = frame.detectedPlanes;
+  if (!planes || planes.size === 0) return;
+  const ref = renderer.xr.getReferenceSpace();
+  camera.getWorldPosition(headPos);
+
+  let floor = null;   // Fläche, die die Quest ausdrücklich als "floor" kennt
+  let lowest = null;  // sonst: die tiefste waagrechte Fläche deutlich unter dem Kopf
+  for (const plane of planes) {
+    if (plane.orientation !== 'horizontal') continue;
+    const pose = frame.getPose(plane.planeSpace, ref);
+    if (!pose) continue;
+    const y = pose.transform.position.y;
+    if (plane.semanticLabel === 'floor') floor = (floor === null) ? y : Math.min(floor, y);
+    else if (y < headPos.y - 0.8 && (lowest === null || y < lowest)) lowest = y;
+  }
+  const best = floor ?? lowest;
+  if (best !== null && (floorSource === 'none' || Math.abs(best - floorY) > 0.02)) {
+    setFloor(best);
+    floorSource = 'planes';
+  }
+}
+
 const objects = []; // Paare aus { mesh (Grafik), body (Physik) }
 
 function addObject(kind, pos, yaw, color) {
@@ -172,7 +209,7 @@ function spawnWall(headPos, forward) {
   if (f.lengthSq() < 1e-6) f.set(0, 0, -1);
   f.normalize();
   const right = new THREE.Vector3().crossVectors(f, new THREE.Vector3(0, 1, 0)).normalize();
-  const origin = headPos.clone().setY(0).addScaledVector(f, CFG.wallDistance);
+  const origin = headPos.clone().setY(floorY).addScaledVector(f, CFG.wallDistance);
   const yaw = Math.atan2(f.x, f.z);
   const s = CFG.blockSize;
 
@@ -181,12 +218,12 @@ function spawnWall(headPos, forward) {
     for (let c = 0; c < CFG.cols; c++) {
       const x = (c - (CFG.cols - 1) / 2) * s * 1.01 + offset;
       const p = origin.clone().addScaledVector(right, x);
-      p.y = s / 2 + r * s * 1.001 + 0.001;
+      p.y = floorY + s / 2 + r * s * 1.001 + 0.001;
       addObject('box', p, yaw, COLORS[(r + c) % COLORS.length]);
     }
   }
 
-  const topY = CFG.rows * s + 0.01;
+  const topY = floorY + CFG.rows * s + 0.01;
   [-1.5, 1.5].forEach((x, i) => {
     const p = origin.clone().addScaledVector(right, x * s);
     p.y = topY + s * 0.5;
@@ -216,6 +253,7 @@ const handDir = new THREE.Vector3();
 const handQuat = new THREE.Quaternion();
 const toObj = new THREE.Vector3();
 const toTarget = new THREE.Vector3();
+const gripPos = new THREE.Vector3();
 const target = new THREE.Vector3();
 
 function readHand(controller) {
@@ -312,10 +350,26 @@ function updateStick(controller, dt, now) {
     }
   }
 
+  // A- bzw. X-Taste: Controller auf den Boden halten und drücken = Boden hier festlegen
+  const buttonA = ud.inputSource?.gamepad?.buttons?.[4]?.pressed ?? false;
+  if (buttonA && !ud.prevA) {
+    ud.grip.getWorldPosition(gripPos);
+    setFloor(gripPos.y - 0.03); // der Controller-Ring liegt ein paar Zentimeter über dem Boden
+    floorSource = 'manual';
+    respawnInFront();
+    haptic(controller, 1.0, 150);
+    ud.showUntil = now + S.labelSeconds;
+    ud.labelOverride = 'Boden gesetzt';
+  }
+  ud.prevA = buttonA;
+
   const fx = ud.fx;
   const adjusting = now < ud.showUntil;
   fx.label.visible = adjusting;
-  if (adjusting) {
+  if (!adjusting) ud.labelOverride = null;
+  if (adjusting && ud.labelOverride) {
+    drawLabel(fx, ud.labelOverride, 0xffffff);
+  } else if (adjusting) {
     const deg = Math.round(THREE.MathUtils.radToDeg(ud.angle * 2)); // voller Öffnungswinkel
     const pct = Math.round(ud.power * 100);
     drawLabel(fx, `${deg}° · ${pct} %`, ud.mode === 'pull' ? PULL_COLOR : PUSH_COLOR);
@@ -525,17 +579,25 @@ for (let i = 0; i < 2; i++) {
   const grip = renderer.xr.getControllerGrip(i); // für das 3D-Modell des Controllers
   grip.add(modelFactory.createControllerModel(grip));
   scene.add(grip);
+  controller.userData.grip = grip;
 
   controllers.push(controller);
 }
 
 // ================= Start & Spielschleife =================
-document.body.appendChild(ARButton.createButton(renderer, { optionalFeatures: ['local-floor'] }));
+// 'plane-detection' liefert die Flächen aus dem Raumscan (die Quest fragt einmal nach der Erlaubnis für Raumdaten)
+document.body.appendChild(ARButton.createButton(renderer, { optionalFeatures: ['local-floor', 'plane-detection'] }));
 
 spawnWall(camera.position, new THREE.Vector3(0, 0, -1)); // Vorschau am Desktop
 
-let spawnPending = 0;
-renderer.xr.addEventListener('sessionstart', () => { spawnPending = 5; }); // nach ein paar Frames vor dir aufbauen
+let waitingForSpawn = false;
+let sessionStart = 0;
+renderer.xr.addEventListener('sessionstart', () => {
+  floorSource = 'none';
+  setFloor(0);
+  waitingForSpawn = true;
+  sessionStart = performance.now() / 1000;
+});
 
 window.addEventListener('resize', () => {
   camera.aspect = window.innerWidth / window.innerHeight;
@@ -544,13 +606,23 @@ window.addEventListener('resize', () => {
 });
 
 const clock = new THREE.Clock();
-renderer.setAnimationLoop((time) => {
+renderer.setAnimationLoop((time, frame) => {
   const dt = Math.min(clock.getDelta(), 1 / 30);
+  const now = time / 1000;
 
-  if (spawnPending > 0 && --spawnPending === 0) respawnInFront();
+  detectFloor(frame);
+
+  // Mauer erst aufbauen, wenn der Boden gefunden wurde (spätestens nach 2 Sekunden)
+  if (waitingForSpawn) {
+    const elapsed = performance.now() / 1000 - sessionStart;
+    if ((floorSource !== 'none' && elapsed > 0.3) || elapsed > 2) {
+      waitingForSpawn = false;
+      respawnInFront();
+    }
+  }
 
   for (const c of controllers) {
-    const adjusting = updateStick(c, dt, time / 1000);
+    const adjusting = updateStick(c, dt, now);
     if (c.userData.mode === 'pull') updatePull(c, dt, time, adjusting);
     else updatePushFx(c, dt, adjusting);
   }
