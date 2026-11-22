@@ -24,7 +24,7 @@
 <div id="info">
   <h1>Repulsor</h1>
   <p>Auf der Quest 3 unten auf „START AR“ tippen.</p>
-  <p>Trigger halten: Druckwelle · Grip-Taste: neue Mauer vor dir</p>
+  <p>Linker Trigger halten: ansaugen · Rechter Trigger drücken: Druckwelle · Grip: neue Mauer</p>
 </div>
 
 <script type="module">
@@ -39,11 +39,29 @@ const CFG = {
   blockSize: 0.22,    // Kantenlänge der Würfel (Meter)
   cols: 6,
   rows: 5,
-  blastRange: 4.0,    // Reichweite der Druckwelle (Meter)
-  blastAngle: 0.45,   // halber Öffnungswinkel des Kegels (Radiant, ca. 26°)
-  blastForce: 25,     // Stärke der Druckwelle
+
+  // Rechter Controller: Druckwelle
+  push: {
+    range: 4.5,       // Reichweite (Meter)
+    angle: 0.6,       // halber Öffnungswinkel (Radiant, ca. 34°)
+    force: 9,         // Geschwindigkeit, die ein Objekt maximal bekommt (m/s)
+    speed: 9,         // Ausbreitungsgeschwindigkeit der Welle (m/s)
+    cooldown: 0.35,   // Mindestabstand zwischen zwei Wellen (Sekunden)
+  },
+
+  // Linker Controller: Ansaugen
+  pull: {
+    range: 5,         // Reichweite (Meter)
+    angle: 0.5,       // halber Öffnungswinkel (Radiant, ca. 29°)
+    accel: 28,        // Zugkraft (Beschleunigung in m/s²)
+    holdDistance: 0.5,// wie weit vor der Hand die Objekte schweben (Meter)
+    holdRadius: 0.7,  // ab diesem Abstand zum Haltepunkt werden Objekte "festgehalten"
+    maxSpeed: 5,      // Höchstgeschwindigkeit beim Ansaugen (m/s)
+  },
 };
 const COLORS = [0x4f8cff, 0xff6b6b, 0xffc145, 0x3ddc97, 0xb388ff, 0xff8fd8];
+const PUSH_COLOR = 0x66ccff;
+const PULL_COLOR = 0xffa040;
 
 // ================= three.js: Renderer, Szene, Kamera =================
 const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
@@ -179,42 +197,238 @@ function respawnInFront() {
   spawnWall(pos, dir);
 }
 
-// ================= Controller (über WebXR) =================
-function makeRepulsorFx() {
-  const group = new THREE.Group();
-  const core = new THREE.Mesh(
-    new THREE.SphereGeometry(0.015, 16, 12),
-    new THREE.MeshBasicMaterial({ color: 0x9fe8ff })
-  );
-  const length = 1.2;
-  const coneGeo = new THREE.ConeGeometry(Math.tan(CFG.blastAngle) * length, length, 32, 1, true);
-  coneGeo.rotateX(Math.PI / 2);         // Spitze zeigt zur Hand ...
-  coneGeo.translate(0, 0, -length / 2); // ... und der Kegel öffnet sich nach vorne (-Z)
-  const cone = new THREE.Mesh(coneGeo, new THREE.MeshBasicMaterial({
-    color: 0x66ccff, transparent: true, opacity: 0.25,
-    blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide,
-  }));
-  cone.visible = false;
-  group.add(core, cone);
-  return { group, core, cone };
+// ================= Hilfsfunktionen =================
+const handPos = new THREE.Vector3();
+const handDir = new THREE.Vector3();
+const handQuat = new THREE.Quaternion();
+const toObj = new THREE.Vector3();
+const toTarget = new THREE.Vector3();
+const target = new THREE.Vector3();
+
+function readHand(controller) {
+  controller.getWorldPosition(handPos);
+  controller.getWorldQuaternion(handQuat);
+  handDir.set(0, 0, -1).applyQuaternion(handQuat);
 }
 
+function haptic(controller, intensity, ms) {
+  const actuator = controller.userData.inputSource?.gamepad?.hapticActuators?.[0];
+  try { actuator?.pulse(intensity, ms); } catch (e) { /* nicht unterstützt */ }
+}
+
+function additiveMaterial(color, opacity) {
+  return new THREE.MeshBasicMaterial({
+    color, transparent: true, opacity,
+    blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide,
+  });
+}
+
+// ================= Effekte an der Hand =================
+const FX_LENGTH = 1.2;
+function makeHandFx() {
+  const group = new THREE.Group();
+
+  const core = new THREE.Mesh(new THREE.SphereGeometry(0.015, 16, 12), new THREE.MeshBasicMaterial({ color: PUSH_COLOR }));
+
+  // Kegel für das Ansaugen
+  const coneGeo = new THREE.ConeGeometry(Math.tan(CFG.pull.angle) * FX_LENGTH, FX_LENGTH, 32, 1, true);
+  coneGeo.rotateX(Math.PI / 2);            // Spitze zeigt zur Hand ...
+  coneGeo.translate(0, 0, -FX_LENGTH / 2); // ... und der Kegel öffnet sich nach vorne (-Z)
+  const cone = new THREE.Mesh(coneGeo, additiveMaterial(PULL_COLOR, 0.12));
+  cone.visible = false;
+
+  // Ringe, die beim Ansaugen zur Hand hin wandern
+  const rings = [];
+  for (let k = 0; k < 3; k++) {
+    const ring = new THREE.Mesh(new THREE.RingGeometry(0.9, 1.0, 40), additiveMaterial(PULL_COLOR, 0.5));
+    ring.visible = false;
+    rings.push(ring);
+    group.add(ring);
+  }
+
+  group.add(core, cone);
+  return { group, core, cone, rings, flash: 0 };
+}
+
+// ================= Rechts: Druckwelle =================
+const waves = [];
+const waveGeo = new THREE.RingGeometry(0.85, 1.0, 64);
+
+function fireShockwave(controller) {
+  readHand(controller);
+  const ring = new THREE.Mesh(waveGeo, additiveMaterial(PUSH_COLOR, 0.8));
+  scene.add(ring);
+  waves.push({
+    origin: handPos.clone(),
+    dir: handDir.clone(),
+    quat: handQuat.clone(),
+    radius: 0.05,
+    hit: new Set(),
+    ring,
+  });
+  controller.userData.fx.flash = 1;
+  haptic(controller, 1.0, 120);
+}
+
+function updateWaves(dt) {
+  const P = CFG.push;
+  const s = CFG.blockSize;
+  for (let i = waves.length - 1; i >= 0; i--) {
+    const w = waves[i];
+    w.radius += P.speed * dt;
+
+    // Jedes Objekt wird genau einmal getroffen, wenn die Wellenfront es erreicht
+    for (const { body } of objects) {
+      if (w.hit.has(body)) continue;
+      toObj.set(body.position.x - w.origin.x, body.position.y - w.origin.y, body.position.z - w.origin.z);
+      const dist = toObj.length();
+      if (dist > w.radius || dist > P.range || dist < 1e-3) continue;
+      const angle = w.dir.angleTo(toObj);
+      if (angle > P.angle) continue;
+
+      w.hit.add(body);
+      const falloff = (1 - 0.7 * dist / P.range) * (1 - 0.5 * angle / P.angle);
+      const dv = P.force * falloff * body.mass;
+      toObj.normalize(); // radial vom Ursprung weg – wie eine echte Druckwelle
+      const impulse = new CANNON.Vec3(toObj.x * dv, (toObj.y + 0.25) * dv, toObj.z * dv);
+      // leicht außermittig treffen, damit die Objekte trudeln
+      const offset = new CANNON.Vec3(
+        (Math.random() - 0.5) * s * 0.6,
+        (Math.random() - 0.5) * s * 0.6,
+        (Math.random() - 0.5) * s * 0.6
+      );
+      body.wakeUp();
+      body.applyImpulse(impulse, offset);
+    }
+
+    // Sichtbare Wellenfront: ein Ring, der wächst und verblasst
+    const t = w.radius / P.range;
+    w.ring.position.copy(w.origin).addScaledVector(w.dir, w.radius * Math.cos(P.angle));
+    w.ring.quaternion.copy(w.quat);
+    w.ring.scale.setScalar(Math.max(0.01, w.radius * Math.sin(P.angle)));
+    w.ring.material.opacity = 0.8 * (1 - t);
+
+    if (w.radius >= P.range) {
+      scene.remove(w.ring);
+      w.ring.material.dispose();
+      waves.splice(i, 1);
+    }
+  }
+}
+
+function updatePushFx(controller, dt) {
+  const fx = controller.userData.fx;
+  fx.flash = Math.max(0, fx.flash - dt * 5);
+  fx.core.scale.setScalar(1 + fx.flash * 3);
+}
+
+// ================= Links: Ansaugen =================
+function updatePull(controller, dt, time) {
+  const ud = controller.userData;
+  const fx = ud.fx;
+  const P = CFG.pull;
+
+  fx.cone.visible = ud.active;
+  fx.rings.forEach(r => { r.visible = ud.active; });
+  if (!ud.active) {
+    fx.core.scale.setScalar(1);
+    return;
+  }
+
+  // Ringe wandern von vorne zur Hand
+  fx.rings.forEach((ring, k) => {
+    const phase = (time * 0.0012 + k / fx.rings.length) % 1;
+    const z = FX_LENGTH * (1 - phase);
+    ring.position.set(0, 0, -z);
+    ring.scale.setScalar(Math.max(0.01, Math.tan(P.angle) * z));
+    ring.material.opacity = 0.5 * phase;
+  });
+  fx.core.scale.setScalar(1.4 + Math.random() * 0.4);
+
+  readHand(controller);
+  target.copy(handPos).addScaledVector(handDir, P.holdDistance); // Haltepunkt vor der Hand
+
+  let hits = 0;
+  for (const { body } of objects) {
+    toObj.set(body.position.x - handPos.x, body.position.y - handPos.y, body.position.z - handPos.z);
+    const dist = toObj.length();
+    toTarget.set(target.x - body.position.x, target.y - body.position.y, target.z - body.position.z);
+    const dTarget = toTarget.length();
+    const holding = dTarget < P.holdRadius;
+
+    if (!holding && (dist > P.range || handDir.angleTo(toObj) > P.angle)) continue;
+
+    let accel;
+    if (holding) {
+      // Nahe am Haltepunkt: sanft festhalten, abbremsen und Schwerkraft ausgleichen
+      accel = P.accel * 0.6 * (dTarget / P.holdRadius);
+      const damp = Math.max(0, 1 - 5 * dt);
+      body.velocity.scale(damp, body.velocity);
+      body.angularVelocity.scale(damp, body.angularVelocity);
+      body.applyImpulse(new CANNON.Vec3(0, 9.82 * body.mass * dt, 0));
+    } else {
+      accel = P.accel * (0.4 + 0.6 * (1 - dist / P.range));
+    }
+
+    if (dTarget > 1e-3) {
+      toTarget.multiplyScalar(1 / dTarget);
+      const k = accel * body.mass * dt;
+      body.applyImpulse(new CANNON.Vec3(toTarget.x * k, toTarget.y * k, toTarget.z * k));
+    }
+    body.wakeUp();
+
+    const v = body.velocity.length();
+    if (v > P.maxSpeed) body.velocity.scale(P.maxSpeed / v, body.velocity);
+    hits++;
+  }
+
+  // leichtes, gleichmäßiges Vibrieren
+  if (time - ud.lastPulse > 60) {
+    ud.lastPulse = time;
+    haptic(controller, hits ? 0.35 : 0.1, 60);
+  }
+}
+
+// ================= Controller (über WebXR) =================
 const modelFactory = new XRControllerModelFactory();
 const controllers = [];
+
+function setMode(controller, mode) {
+  const ud = controller.userData;
+  ud.mode = mode;
+  ud.active = false;
+  ud.fx.core.material.color.setHex(mode === 'pull' ? PULL_COLOR : PUSH_COLOR);
+}
+
 for (let i = 0; i < 2; i++) {
   const controller = renderer.xr.getController(i); // Zielstrahl-Position/Richtung aus WebXR
-  const fx = makeRepulsorFx();
+  const fx = makeHandFx();
   controller.add(fx.group);
-  controller.userData = { firing: false, inputSource: null, lastPulse: 0, fx };
+  controller.userData = { mode: 'push', active: false, inputSource: null, lastPulse: 0, lastShot: 0, fx };
 
-  controller.addEventListener('connected', (e) => { controller.userData.inputSource = e.data; });
+  controller.addEventListener('connected', (e) => {
+    controller.userData.inputSource = e.data;
+    setMode(controller, e.data.handedness === 'left' ? 'pull' : 'push');
+  });
   controller.addEventListener('disconnected', () => {
     controller.userData.inputSource = null;
-    controller.userData.firing = false;
+    controller.userData.active = false;
   });
-  controller.addEventListener('selectstart', () => { controller.userData.firing = true; });  // Trigger
-  controller.addEventListener('selectend', () => { controller.userData.firing = false; });
-  controller.addEventListener('squeezestart', () => respawnInFront());                        // Grip
+
+  controller.addEventListener('selectstart', () => { // Trigger gedrückt
+    const ud = controller.userData;
+    if (ud.mode === 'pull') {
+      ud.active = true;
+    } else {
+      const now = performance.now() / 1000;
+      if (now - ud.lastShot >= CFG.push.cooldown) {
+        ud.lastShot = now;
+        fireShockwave(controller);
+      }
+    }
+  });
+  controller.addEventListener('selectend', () => { controller.userData.active = false; }); // losgelassen
+  controller.addEventListener('squeezestart', () => respawnInFront());                       // Grip
   scene.add(controller);
 
   const grip = renderer.xr.getControllerGrip(i); // für das 3D-Modell des Controllers
@@ -222,53 +436,6 @@ for (let i = 0; i < 2; i++) {
   scene.add(grip);
 
   controllers.push(controller);
-}
-
-// ================= Die Druckwelle =================
-const handPos = new THREE.Vector3();
-const handDir = new THREE.Vector3();
-const handQuat = new THREE.Quaternion();
-const toObj = new THREE.Vector3();
-
-function updateBlast(controller, dt, time) {
-  const ud = controller.userData;
-  ud.fx.cone.visible = ud.firing;
-  if (!ud.firing) {
-    ud.fx.core.scale.setScalar(1);
-    return;
-  }
-
-  // Flackern für den Effekt
-  ud.fx.cone.material.opacity = 0.15 + Math.random() * 0.15;
-  ud.fx.core.scale.setScalar(1.5 + Math.random() * 0.5);
-
-  controller.getWorldPosition(handPos);
-  controller.getWorldQuaternion(handQuat);
-  handDir.set(0, 0, -1).applyQuaternion(handQuat);
-
-  let hits = 0;
-  for (const { body } of objects) {
-    toObj.set(body.position.x - handPos.x, body.position.y - handPos.y, body.position.z - handPos.z);
-    const dist = toObj.length();
-    if (dist > CFG.blastRange || dist < 1e-3) continue;
-    const angle = handDir.angleTo(toObj);
-    if (angle > CFG.blastAngle) continue;
-
-    // je näher und je zentraler, desto stärker
-    const strength = CFG.blastForce * (1 - dist / CFG.blastRange) * (1 - angle / CFG.blastAngle);
-    toObj.normalize().add(handDir).normalize(); // Mischung aus Handrichtung und Richtung zum Objekt
-    const k = strength * body.mass * dt;
-    body.wakeUp();
-    body.applyImpulse(new CANNON.Vec3(toObj.x * k, toObj.y * k + k * 0.15, toObj.z * k));
-    hits++;
-  }
-
-  // Vibration im Controller (gedrosselt)
-  if (time - ud.lastPulse > 60) {
-    ud.lastPulse = time;
-    const actuator = ud.inputSource?.gamepad?.hapticActuators?.[0];
-    try { actuator?.pulse(hits ? 0.8 : 0.25, 60); } catch (e) { /* nicht unterstützt */ }
-  }
 }
 
 // ================= Start & Spielschleife =================
@@ -291,7 +458,11 @@ renderer.setAnimationLoop((time) => {
 
   if (spawnPending > 0 && --spawnPending === 0) respawnInFront();
 
-  for (const c of controllers) updateBlast(c, dt, time);
+  for (const c of controllers) {
+    if (c.userData.mode === 'pull') updatePull(c, dt, time);
+    else updatePushFx(c, dt);
+  }
+  updateWaves(dt);
 
   world.step(1 / 72, dt, 3);
 
