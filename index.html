@@ -25,6 +25,7 @@
   <h1>Repulsor</h1>
   <p>Auf der Quest 3 unten auf „START AR“ tippen.</p>
   <p>Linker Trigger halten: ansaugen · Rechter Trigger drücken: Druckwelle · Grip: neue Mauer</p>
+  <p>Sticks: links/rechts = Öffnungswinkel, oben/unten = Stärke</p>
 </div>
 
 <script type="module">
@@ -57,6 +58,18 @@ const CFG = {
     holdDistance: 0.5,// wie weit vor der Hand die Objekte schweben (Meter)
     holdRadius: 0.7,  // ab diesem Abstand zum Haltepunkt werden Objekte "festgehalten"
     maxSpeed: 5,      // Höchstgeschwindigkeit beim Ansaugen (m/s)
+  },
+
+  // Thumbsticks: links/rechts = Öffnungswinkel, oben/unten = Stärke (für jeden Controller getrennt)
+  sticks: {
+    angleMin: 0.15,   // schmalster Kegel (Radiant, ca. 9°)
+    angleMax: 1.2,    // breitester Kegel (Radiant, ca. 69°)
+    powerMin: 0.3,    // schwächste Stärke (30 %)
+    powerMax: 2.5,    // stärkste Stärke (250 %)
+    angleRate: 0.8,   // so schnell ändert sich der Winkel bei vollem Ausschlag (Radiant/s)
+    powerRate: 1.2,   // so schnell ändert sich die Stärke bei vollem Ausschlag (pro Sekunde)
+    deadzone: 0.15,   // kleine Stick-Bewegungen ignorieren
+    labelSeconds: 1.5,// so lange bleibt die Anzeige nach dem Verstellen sichtbar
   },
 };
 const COLORS = [0x4f8cff, 0xff6b6b, 0xffc145, 0x3ddc97, 0xb388ff, 0xff8fd8];
@@ -246,8 +259,72 @@ function makeHandFx() {
     group.add(ring);
   }
 
-  group.add(core, cone);
-  return { group, core, cone, rings, flash: 0 };
+  // Kleines Schild über dem Controller, das Winkel und Stärke anzeigt
+  const canvas = document.createElement('canvas');
+  canvas.width = 256;
+  canvas.height = 64;
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  const label = new THREE.Mesh(
+    new THREE.PlaneGeometry(0.12, 0.03),
+    new THREE.MeshBasicMaterial({ map: texture, transparent: true, depthWrite: false })
+  );
+  label.position.set(0, 0.05, -0.03);
+  label.rotation.x = -0.5;
+  label.visible = false;
+
+  group.add(core, cone, label);
+  return { group, core, cone, rings, label, canvas, texture, labelText: '', flash: 0 };
+}
+
+function drawLabel(fx, text, color) {
+  if (fx.labelText === text) return; // nur neu zeichnen, wenn sich etwas ändert
+  fx.labelText = text;
+  const ctx = fx.canvas.getContext('2d');
+  ctx.clearRect(0, 0, 256, 64);
+  ctx.fillStyle = 'rgba(10, 14, 24, 0.8)';
+  ctx.beginPath();
+  ctx.roundRect(2, 2, 252, 60, 14);
+  ctx.fill();
+  ctx.fillStyle = '#' + color.toString(16).padStart(6, '0');
+  ctx.font = 'bold 30px system-ui, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, 128, 34);
+  fx.texture.needsUpdate = true;
+}
+
+// Liest den Thumbstick und verstellt Winkel (links/rechts) und Stärke (oben/unten)
+function updateStick(controller, dt, now) {
+  const ud = controller.userData;
+  const S = CFG.sticks;
+  const axes = ud.inputSource?.gamepad?.axes;
+  if (axes) {
+    // Quest-Controller: Thumbstick liegt auf axes[2] (x) und axes[3] (y); y ist nach oben negativ
+    const x = axes.length >= 4 ? axes[2] : (axes[0] ?? 0);
+    const y = axes.length >= 4 ? axes[3] : (axes[1] ?? 0);
+    const sx = Math.abs(x) > S.deadzone ? x : 0;
+    const sy = Math.abs(y) > S.deadzone ? y : 0;
+    if (sx || sy) {
+      ud.angle = THREE.MathUtils.clamp(ud.angle + sx * S.angleRate * dt, S.angleMin, S.angleMax);
+      ud.power = THREE.MathUtils.clamp(ud.power - sy * S.powerRate * dt, S.powerMin, S.powerMax);
+      ud.showUntil = now + S.labelSeconds;
+    }
+  }
+
+  const fx = ud.fx;
+  const adjusting = now < ud.showUntil;
+  fx.label.visible = adjusting;
+  if (adjusting) {
+    const deg = Math.round(THREE.MathUtils.radToDeg(ud.angle * 2)); // voller Öffnungswinkel
+    const pct = Math.round(ud.power * 100);
+    drawLabel(fx, `${deg}° · ${pct} %`, ud.mode === 'pull' ? PULL_COLOR : PUSH_COLOR);
+  }
+
+  // Kegel an den aktuellen Winkel anpassen (Geometrie wurde mit CFG.pull.angle gebaut)
+  const f = Math.tan(ud.angle) / Math.tan(CFG.pull.angle);
+  fx.cone.scale.set(f, f, 1);
+  return adjusting;
 }
 
 // ================= Rechts: Druckwelle =================
@@ -255,6 +332,7 @@ const waves = [];
 const waveGeo = new THREE.RingGeometry(0.85, 1.0, 64);
 
 function fireShockwave(controller) {
+  const ud = controller.userData;
   readHand(controller);
   const ring = new THREE.Mesh(waveGeo, additiveMaterial(PUSH_COLOR, 0.8));
   scene.add(ring);
@@ -262,12 +340,15 @@ function fireShockwave(controller) {
     origin: handPos.clone(),
     dir: handDir.clone(),
     quat: handQuat.clone(),
+    angle: ud.angle,                    // Winkel und Stärke zum Zeitpunkt des Schusses
+    force: CFG.push.force * ud.power,
+    opacity: Math.min(1, 0.5 + 0.3 * ud.power),
     radius: 0.05,
     hit: new Set(),
     ring,
   });
-  controller.userData.fx.flash = 1;
-  haptic(controller, 1.0, 120);
+  ud.fx.flash = 1;
+  haptic(controller, Math.min(1, 0.5 + 0.25 * ud.power), 120);
 }
 
 function updateWaves(dt) {
@@ -284,11 +365,11 @@ function updateWaves(dt) {
       const dist = toObj.length();
       if (dist > w.radius || dist > P.range || dist < 1e-3) continue;
       const angle = w.dir.angleTo(toObj);
-      if (angle > P.angle) continue;
+      if (angle > w.angle) continue;
 
       w.hit.add(body);
-      const falloff = (1 - 0.7 * dist / P.range) * (1 - 0.5 * angle / P.angle);
-      const dv = P.force * falloff * body.mass;
+      const falloff = (1 - 0.7 * dist / P.range) * (1 - 0.5 * angle / w.angle);
+      const dv = w.force * falloff * body.mass;
       toObj.normalize(); // radial vom Ursprung weg – wie eine echte Druckwelle
       const impulse = new CANNON.Vec3(toObj.x * dv, (toObj.y + 0.25) * dv, toObj.z * dv);
       // leicht außermittig treffen, damit die Objekte trudeln
@@ -303,10 +384,10 @@ function updateWaves(dt) {
 
     // Sichtbare Wellenfront: ein Ring, der wächst und verblasst
     const t = w.radius / P.range;
-    w.ring.position.copy(w.origin).addScaledVector(w.dir, w.radius * Math.cos(P.angle));
+    w.ring.position.copy(w.origin).addScaledVector(w.dir, w.radius * Math.cos(w.angle));
     w.ring.quaternion.copy(w.quat);
-    w.ring.scale.setScalar(Math.max(0.01, w.radius * Math.sin(P.angle)));
-    w.ring.material.opacity = 0.8 * (1 - t);
+    w.ring.scale.setScalar(Math.max(0.01, w.radius * Math.sin(w.angle)));
+    w.ring.material.opacity = w.opacity * (1 - t);
 
     if (w.radius >= P.range) {
       scene.remove(w.ring);
@@ -316,19 +397,20 @@ function updateWaves(dt) {
   }
 }
 
-function updatePushFx(controller, dt) {
+function updatePushFx(controller, dt, adjusting) {
   const fx = controller.userData.fx;
   fx.flash = Math.max(0, fx.flash - dt * 5);
   fx.core.scale.setScalar(1 + fx.flash * 3);
+  fx.cone.visible = adjusting; // beim Verstellen zeigt ein Kegel, wie breit die Welle wird
 }
 
 // ================= Links: Ansaugen =================
-function updatePull(controller, dt, time) {
+function updatePull(controller, dt, time, adjusting) {
   const ud = controller.userData;
   const fx = ud.fx;
   const P = CFG.pull;
 
-  fx.cone.visible = ud.active;
+  fx.cone.visible = ud.active || adjusting;
   fx.rings.forEach(r => { r.visible = ud.active; });
   if (!ud.active) {
     fx.core.scale.setScalar(1);
@@ -340,7 +422,7 @@ function updatePull(controller, dt, time) {
     const phase = (time * 0.0012 + k / fx.rings.length) % 1;
     const z = FX_LENGTH * (1 - phase);
     ring.position.set(0, 0, -z);
-    ring.scale.setScalar(Math.max(0.01, Math.tan(P.angle) * z));
+    ring.scale.setScalar(Math.max(0.01, Math.tan(ud.angle) * z));
     ring.material.opacity = 0.5 * phase;
   });
   fx.core.scale.setScalar(1.4 + Math.random() * 0.4);
@@ -356,18 +438,18 @@ function updatePull(controller, dt, time) {
     const dTarget = toTarget.length();
     const holding = dTarget < P.holdRadius;
 
-    if (!holding && (dist > P.range || handDir.angleTo(toObj) > P.angle)) continue;
+    if (!holding && (dist > P.range || handDir.angleTo(toObj) > ud.angle)) continue;
 
     let accel;
     if (holding) {
       // Nahe am Haltepunkt: sanft festhalten, abbremsen und Schwerkraft ausgleichen
-      accel = P.accel * 0.6 * (dTarget / P.holdRadius);
+      accel = P.accel * 0.6 * (dTarget / P.holdRadius); // Halten bleibt unabhängig von der Stärke stabil
       const damp = Math.max(0, 1 - 5 * dt);
       body.velocity.scale(damp, body.velocity);
       body.angularVelocity.scale(damp, body.angularVelocity);
       body.applyImpulse(new CANNON.Vec3(0, 9.82 * body.mass * dt, 0));
     } else {
-      accel = P.accel * (0.4 + 0.6 * (1 - dist / P.range));
+      accel = P.accel * ud.power * (0.4 + 0.6 * (1 - dist / P.range));
     }
 
     if (dTarget > 1e-3) {
@@ -378,7 +460,8 @@ function updatePull(controller, dt, time) {
     body.wakeUp();
 
     const v = body.velocity.length();
-    if (v > P.maxSpeed) body.velocity.scale(P.maxSpeed / v, body.velocity);
+    const maxSpeed = P.maxSpeed * Math.sqrt(ud.power);
+    if (v > maxSpeed) body.velocity.scale(maxSpeed / v, body.velocity);
     hits++;
   }
 
@@ -397,14 +480,22 @@ function setMode(controller, mode) {
   const ud = controller.userData;
   ud.mode = mode;
   ud.active = false;
-  ud.fx.core.material.color.setHex(mode === 'pull' ? PULL_COLOR : PUSH_COLOR);
+  ud.angle = CFG[mode].angle; // Startwerte; danach per Stick verstellbar
+  ud.power = 1;
+  const color = mode === 'pull' ? PULL_COLOR : PUSH_COLOR;
+  ud.fx.core.material.color.setHex(color);
+  ud.fx.cone.material.color.setHex(color);
+  ud.fx.labelText = '';
 }
 
 for (let i = 0; i < 2; i++) {
   const controller = renderer.xr.getController(i); // Zielstrahl-Position/Richtung aus WebXR
   const fx = makeHandFx();
   controller.add(fx.group);
-  controller.userData = { mode: 'push', active: false, inputSource: null, lastPulse: 0, lastShot: 0, fx };
+  controller.userData = {
+    mode: 'push', active: false, inputSource: null, lastPulse: 0, lastShot: 0,
+    angle: CFG.push.angle, power: 1, showUntil: 0, fx,
+  };
 
   controller.addEventListener('connected', (e) => {
     controller.userData.inputSource = e.data;
@@ -459,8 +550,9 @@ renderer.setAnimationLoop((time) => {
   if (spawnPending > 0 && --spawnPending === 0) respawnInFront();
 
   for (const c of controllers) {
-    if (c.userData.mode === 'pull') updatePull(c, dt, time);
-    else updatePushFx(c, dt);
+    const adjusting = updateStick(c, dt, time / 1000);
+    if (c.userData.mode === 'pull') updatePull(c, dt, time, adjusting);
+    else updatePushFx(c, dt, adjusting);
   }
   updateWaves(dt);
 
