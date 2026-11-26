@@ -173,7 +173,7 @@ function updateHud(now) {
   const toMarker = Math.hypot(headPos.x - marker.position.x, headPos.z - marker.position.z);
 
   const lines = [
-    `Boden: ${floorSource}  y = ${floorY.toFixed(2)} m   Resets: ${referenceResets}`,
+    `Boden: ${floorSource}  y = ${floorY.toFixed(2)} m   Flächen: ${planeCount < 0 ? 'keine Raumdaten' : planeCount}${floorPlaneSeen ? ' (Boden erkannt)' : ''}`,
     `Kopf: x ${headPos.x.toFixed(2)}  y ${headPos.y.toFixed(2)}  z ${headPos.z.toFixed(2)}   Abstand Ring: ${toMarker.toFixed(2)} m`,
     `Blöcke: ${objects.length}   max. bewegt: ${maxMoved.toFixed(2)} m   unter Boden: ${belowFloor}`,
   ];
@@ -202,28 +202,49 @@ function setFloor(y) {
 
 // Sucht im Raumscan (WebXR plane-detection) nach dem Boden
 const headPos = new THREE.Vector3();
+let planeCount = -1;        // -1 = Raumdaten nicht verfügbar (keine Erlaubnis / nicht unterstützt)
+let floorPlaneSeen = false; // hat die Quest eine Fläche ausdrücklich als Boden markiert?
+
+function planeArea(plane) {
+  // Fläche des Begrenzungsrechtecks des Polygons (in der Ebene der Fläche: x/z)
+  let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+  for (const p of plane.polygon) {
+    minX = Math.min(minX, p.x); maxX = Math.max(maxX, p.x);
+    minZ = Math.min(minZ, p.z); maxZ = Math.max(maxZ, p.z);
+  }
+  return (maxX - minX) * (maxZ - minZ);
+}
+
 function detectFloor(frame) {
-  // Einmal gefundener Boden bleibt fest – sonst könnte er beim Herumlaufen springen
-  if (!frame || floorSource !== 'none') return;
+  if (!frame) return;
   const planes = frame.detectedPlanes;
-  if (!planes || planes.size === 0) return;
+  planeCount = planes ? planes.size : -1;
+
+  // Einmal gefundener Boden bleibt fest – sonst könnte er beim Herumlaufen springen
+  if (floorSource !== 'none' || !planes || planes.size === 0) return;
   const ref = renderer.xr.getReferenceSpace();
   camera.getWorldPosition(headPos);
 
   let floor = null;   // Fläche, die die Quest ausdrücklich als "floor" kennt
-  let lowest = null;  // sonst: die tiefste waagrechte Fläche deutlich unter dem Kopf
+  let lowest = null;  // sonst: tiefste GROSSE waagrechte Fläche weit unter dem Kopf (kein Tisch, kein Sofa)
   for (const plane of planes) {
     if (plane.orientation !== 'horizontal') continue;
     const pose = frame.getPose(plane.planeSpace, ref);
     if (!pose) continue;
     const y = pose.transform.position.y;
-    if (plane.semanticLabel === 'floor') floor = (floor === null) ? y : Math.min(floor, y);
-    else if (y < headPos.y - 0.8 && (lowest === null || y < lowest)) lowest = y;
+    if (plane.semanticLabel === 'floor') {
+      floorPlaneSeen = true;
+      floor = (floor === null) ? y : Math.min(floor, y);
+    } else if (y < headPos.y - 1.2 && planeArea(plane) > 1.5 && (lowest === null || y < lowest)) {
+      lowest = y;
+    }
   }
   const best = floor ?? lowest;
   if (best !== null) {
     setFloor(best);
     floorSource = 'planes';
+    // Kam der Boden erst, nachdem die Mauer schon stand: Mauer auf dem richtigen Boden neu aufbauen
+    if (!waitingForSpawn) respawnInFront();
   }
 }
 
@@ -678,6 +699,8 @@ let waitingForSpawn = false;
 let sessionStart = 0;
 renderer.xr.addEventListener('sessionstart', () => {
   floorSource = 'none';
+  floorPlaneSeen = false;
+  planeCount = -1;
   setFloor(0);
   waitingForSpawn = true;
   sessionStart = performance.now() / 1000;
